@@ -13,6 +13,7 @@ resource "terraform_data" "staging_demo" {
   input = {
     environment = "staging"
     size        = var.example_instance_size
+    owner       = "payment-service"
   }
 }
 
