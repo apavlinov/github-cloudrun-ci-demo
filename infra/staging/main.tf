@@ -6,7 +6,7 @@ terraform {
 
 variable "example_instance_size" {
   type    = string
-  default = "small"
+  default = "medium"
 }
 
 resource "terraform_data" "staging_demo" {
