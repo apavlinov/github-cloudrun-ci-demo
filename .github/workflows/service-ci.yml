@@ -1,0 +1,42 @@
+# Reusable: syntax → unit tests → Docker build → running-container checks for one service.
+# On main the tested image is uploaded once and reused by release-service.yml.
+name: service-ci
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  SERVICE: ${{ inputs.service }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Syntax
+        run: python -m compileall -q "services/$SERVICE" shared
+      - name: Unit tests
+        run: python -m unittest discover -s "services/$SERVICE/tests" -p 'test_*.py' -v
+      # Docker is built into GitHub-hosted runners: no Docker-in-Docker service needed.
+      - name: Build image
+        run: sh scripts/build_image.sh "$SERVICE"
+      - name: Verify running container
+        run: sh scripts/verify_image.sh "$SERVICE"
+      - name: Upload tested image
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-${{ inputs.service }}
+          path: .artifacts/${{ inputs.service }}/
+          include-hidden-files: true
+          retention-days: 2

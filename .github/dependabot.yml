@@ -1,0 +1,12 @@
+# Keeps SHA-pinned actions and service base images up to date.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directories:
+      - /services/*
+    schedule:
+      interval: weekly

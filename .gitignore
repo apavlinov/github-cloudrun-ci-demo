@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+infra/staging/tfplan
+infra/staging/plan.txt
+.artifacts/
+.env
+infra/staging/plan.json
+.DS_Store

@@ -1,0 +1,30 @@
+# Which changed paths trigger which part of the pipeline.
+# Read by dorny/paths-filter in ci.yml and by tests/test_pipeline.py.
+# PR: compared with the base branch. Push to main: with the previous commit.
+common: &common
+  - shared/**
+  - scripts/**
+  - .github/workflows/**
+  - .github/path-filters.yml
+
+payment:
+  - *common
+  - services/payment-service/**
+
+notification:
+  - *common
+  - services/notification-service/**
+
+# Plan also re-validates on workflow changes; apply only runs for real infra changes.
+infra:
+  - infra/**
+  - .github/workflows/**
+
+infra_code:
+  - infra/**
+
+# Self-test: actionlint + tests/ for workflow, script and test changes.
+pipeline:
+  - .github/**
+  - scripts/**
+  - tests/**

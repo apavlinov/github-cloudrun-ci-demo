@@ -1,0 +1,225 @@
+# GitHub Actions demo: PR validates and builds; main rebuilds the merge commit ONCE,
+# tests that same image, then performs a mock Cloud Run release.
+# Terraform uses the built-in terraform_data resource (NO GCP access).
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# PR: a new push cancels the previous run. main: every commit keeps its own run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      payment: ${{ steps.filter.outputs.payment }}
+      notification: ${{ steps.filter.outputs.notification }}
+      infra: ${{ steps.filter.outputs.infra }}
+      infra_code: ${{ steps.filter.outputs.infra_code }}
+      pipeline: ${{ steps.filter.outputs.pipeline }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: .github/path-filters.yml
+
+  pipeline_selftest:
+    needs: changes
+    if: needs.changes.outputs.pipeline == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: actionlint
+        uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
+        with:
+          args: -color
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --quiet pyyaml
+      - run: python -m unittest discover -s tests -v
+
+  ci_payment:
+    needs: changes
+    if: needs.changes.outputs.payment == 'true'
+    uses: ./.github/workflows/service-ci.yml
+    with:
+      service: payment-service
+
+  ci_notification:
+    needs: changes
+    if: needs.changes.outputs.notification == 'true'
+    uses: ./.github/workflows/service-ci.yml
+    with:
+      service: notification-service
+
+  # Real local Terraform plan with NO cloud provider and NO persistent backend.
+  terraform_plan:
+    needs: changes
+    if: needs.changes.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    defaults:
+      run:
+        working-directory: infra/staging
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+      - run: terraform fmt -check
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate
+      - run: terraform plan -out=tfplan -input=false
+      - name: Summarize plan
+        run: |
+          terraform show -no-color tfplan > plan.txt
+          terraform show -json tfplan \
+            | jq -c '[.resource_changes[]?.change.actions?] | flatten
+              | {create: map(select(. == "create")) | length, update: map(select(. == "update")) | length, delete: map(select(. == "delete")) | length}' \
+            > plan.json
+          {
+            echo "### Terraform plan (staging): $(cat plan.json)"
+            echo '```'
+            cat plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      # Sticky PR comment; fork PRs get a read-only token, so they only see the job summary.
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- terraform-plan:staging -->';
+            const counts = JSON.parse(fs.readFileSync('infra/staging/plan.json', 'utf8'));
+            let plan = fs.readFileSync('infra/staging/plan.txt', 'utf8');
+            if (plan.length > 60000) plan = plan.slice(0, 60000) + '\n... truncated, see the job summary';
+            const fence = '```';
+            const body = [
+              marker,
+              '### Terraform plan: staging',
+              `**${counts.create} to add, ${counts.update} to change, ${counts.delete} to destroy**`,
+              '',
+              '<details><summary>Show plan</summary>',
+              '',
+              fence, plan, fence,
+              '</details>',
+            ].join('\n');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+      # Only main needs the binary plan (for apply); PR runs never store it as an artifact.
+      - name: Upload plan for apply
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tfplan-staging
+          path: infra/staging/tfplan
+          retention-days: 2
+
+  # "Blocked" = "Waiting for review": required reviewers are set on the staging-infra environment.
+  terraform_apply:
+    needs: [changes, terraform_plan]
+    if: github.event_name == 'push' && needs.changes.outputs.infra_code == 'true'
+    runs-on: ubuntu-latest
+    environment: staging-infra
+    concurrency:
+      group: staging-infra
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: infra/staging
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tfplan-staging
+          path: infra/staging
+      - run: terraform init -backend=false -input=false
+      - run: terraform apply -input=false tfplan
+      - run: terraform output -json
+      - run: echo 'MOCK APPLY ONLY; local state is NOT persisted!'
+
+  # Always on main. Passes when apply succeeded or was not needed.
+  # Skipped jobs cascade in GitHub Actions, hence !cancelled() and explicit result checks;
+  # a FAILED plan also skips apply, so it must be rejected here explicitly.
+  infra_ready:
+    needs: [changes, terraform_plan, terraform_apply]
+    if: >-
+      !cancelled() && github.event_name == 'push' &&
+      needs.changes.result == 'success' &&
+      needs.terraform_plan.result != 'failure' &&
+      contains(fromJSON('["success", "skipped"]'), needs.terraform_apply.result)
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Infra gate passed (apply completed or not needed).'
+
+  # Whole deploy → smoke → promote runs under ONE per-service lock.
+  release_payment:
+    needs: [changes, ci_payment, infra_ready]
+    if: >-
+      !cancelled() && github.event_name == 'push' &&
+      needs.changes.outputs.payment == 'true' &&
+      needs.ci_payment.result == 'success' &&
+      needs.infra_ready.result == 'success'
+    concurrency:
+      group: staging-payment-service
+      cancel-in-progress: false
+    uses: ./.github/workflows/release-service.yml
+    with:
+      service: payment-service
+      environment: staging
+
+  release_notification:
+    needs: [changes, ci_notification, infra_ready]
+    if: >-
+      !cancelled() && github.event_name == 'push' &&
+      needs.changes.outputs.notification == 'true' &&
+      needs.ci_notification.result == 'success' &&
+      needs.infra_ready.result == 'success'
+    concurrency:
+      group: staging-notification-service
+      cancel-in-progress: false
+    uses: ./.github/workflows/release-service.yml
+    with:
+      service: notification-service
+      environment: staging
+
+  # The ONLY required status check: jobs skipped by path filters count as passed.
+  ci_ok:
+    needs: [changes, pipeline_selftest, ci_payment, ci_notification, terraform_plan]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: All CI jobs succeeded or were skipped
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "$RESULTS"
+          echo "$RESULTS" | jq -e 'all(.[]; . == "success" or . == "skipped")'

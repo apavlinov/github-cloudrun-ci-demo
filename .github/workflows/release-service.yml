@@ -1,0 +1,77 @@
+# Reusable: MOCK Cloud Run release of the exact image tested in service-ci.yml.
+# deploy (0% traffic) → smoke → promote (100%). The caller job holds the per-service
+# concurrency lock for the whole sequence, so releases of one service never interleave.
+# promote is the GitHub deployment; protection rules on the environment gate it.
+name: release-service
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        type: string
+        required: true
+      environment:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  SERVICE: ${{ inputs.service }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-${{ inputs.service }}
+          path: .artifacts/${{ inputs.service }}
+      - run: python3 scripts/mock_cloud_run.py deploy "$SERVICE"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: candidate-${{ inputs.service }}
+          path: .artifacts/${{ inputs.service }}/candidate.json
+          include-hidden-files: true
+          retention-days: 2
+
+  smoke:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: candidate-${{ inputs.service }}
+          path: .artifacts/${{ inputs.service }}
+      - run: python3 scripts/mock_cloud_run.py smoke "$SERVICE"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smoke-${{ inputs.service }}
+          path: .artifacts/${{ inputs.service }}/smoke.json
+          include-hidden-files: true
+          retention-days: 2
+
+  promote:
+    needs: smoke
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: candidate-${{ inputs.service }}
+          path: .artifacts/${{ inputs.service }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: smoke-${{ inputs.service }}
+          path: .artifacts/${{ inputs.service }}
+      - run: python3 scripts/mock_cloud_run.py promote "$SERVICE"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ inputs.service }}
+          path: .artifacts/${{ inputs.service }}/release.json
+          include-hidden-files: true
+          retention-days: 7
