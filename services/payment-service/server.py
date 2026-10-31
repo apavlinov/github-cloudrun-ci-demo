@@ -9,6 +9,7 @@ from shared.contracts import health_payload
 SERVICE = "payment-service"
 
 
+# Routes: /health (readiness) and /version (deployed commit).
 def response(path: str) -> tuple[int, dict[str, str]]:
     route = urlsplit(path).path
     if route == "/health":
