@@ -1,4 +1,4 @@
-"""Tiny HTTP service; no third-party dependencies."""
+"""Tiny payment HTTP service (staging demo); no third-party dependencies."""
 import json
 import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
